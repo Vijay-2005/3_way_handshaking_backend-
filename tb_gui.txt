@@ -1,0 +1,268 @@
+//=========================
+// Testbench: tb_top.sv
+//=========================
+`timescale 1ns/1ps
+
+interface tcpip_if(input logic clk);
+    logic rst;
+    logic [7:0] data_in;
+    logic [7:0] checksum_in;
+    logic valid_in;
+    logic [7:0] data_out;
+    logic valid_out;
+endinterface
+
+class packet;
+    rand byte data;
+    rand bit [1:0] flags;
+    byte checksum;
+
+    constraint valid_flags { flags inside {0,1,2,3}; }
+    constraint flag_data_combo {
+        if (flags == 1) data == "S";
+        else if (flags == 2) data == "K";
+        else if (flags == 3) data == "Z";
+        else data inside { "X", "Y" };
+    }
+
+    function void compute_checksum();
+        checksum = data ^ 8'hFF;
+    endfunction
+
+    function void display(string tag);
+        $display("[%0t ns][%s] Data=%s Checksum=0x%0h Flags=%0d", $time, tag, data, checksum, flags);
+    endfunction
+endclass
+
+class driver;
+    virtual tcpip_if vif;
+    function new(virtual tcpip_if vif);
+        this.vif = vif;
+    endfunction
+    task send(packet p);
+        repeat($urandom_range(0, 2)) @(posedge vif.clk);
+        @(posedge vif.clk);
+        vif.valid_in <= 1;
+        vif.data_in <= p.data;
+        vif.checksum_in <= p.checksum;
+        p.display("DRIVER");
+        @(posedge vif.clk);
+        vif.valid_in <= 0;
+    endtask
+endclass
+
+class monitor;
+    virtual tcpip_if vif;
+    mailbox #(packet) mon2scb;
+    function new(virtual tcpip_if vif, mailbox #(packet) mon2scb);
+        this.vif = vif;
+        this.mon2scb = mon2scb;
+    endfunction
+
+    task monitor_output();
+        packet p;
+        forever begin
+            @(posedge vif.clk);
+            if (vif.valid_out) begin
+                p = new();
+                p.data = vif.data_out;
+                p.display("MONITOR");
+                mon2scb.put(p);
+            end
+        end
+    endtask
+endclass
+
+class scoreboard;
+    mailbox #(packet) mon2scb;
+    byte expected[$], actual[$];
+    int total, pass, fail;
+    bit result[$];
+
+    function new(mailbox #(packet) mon2scb);
+        this.mon2scb = mon2scb;
+    endfunction
+
+    task compare();
+        packet p;
+        forever begin
+            mon2scb.get(p);
+            actual.push_back(p.data);
+            if (expected.size() > 0) begin
+                byte exp = expected.pop_front();
+                if (p.data == exp) begin
+                    pass++;
+                    result.push_back(1);
+                    $display("[%0t ns][SCOREBOARD] PASS: %s", $time, p.data);
+                end else begin
+                    fail++;
+                    result.push_back(0);
+                    $display("[%0t ns][SCOREBOARD] FAIL: %s (Expected: %s)", $time, p.data, exp);
+                end
+            end else begin
+                fail++;
+                result.push_back(0);
+                $display("[%0t ns][SCOREBOARD] FAIL: %s (Unexpected)", $time, p.data);
+            end
+            total++;
+        end
+    endtask
+
+    task report();
+        $display("\n=== PACKET TRACE TABLE ===");
+        for (int i = 0; i < total; i++)
+            $display("| %2d | Actual=%s | Match=%s", i+1, actual[i], result[i] ? "Yes" : "No");
+    endtask
+endclass
+
+covergroup input_cg(ref logic [7:0] sig);
+    coverpoint sig {
+        bins syn   = { "S" };
+        bins ack   = { "K" };
+        bins noise = { "Z" };
+        bins misc  = { "X", "Y" };
+    }
+endgroup
+
+covergroup fsm_cg(ref logic [1:0] st, ref logic clk);
+    coverpoint st;
+    transition: coverpoint st {
+        bins i2s = (0 => 1);
+        bins s2a = (1 => 2);
+    }
+endgroup
+
+class test;
+    driver d;
+    monitor m;
+    scoreboard s;
+    mailbox #(packet) mbox;
+    virtual tcpip_if vif;
+    input_cg icg;
+    fsm_cg scg;
+    logic [1:0] state_sig;
+    logic clk_sig;
+
+    function new(virtual tcpip_if vif, ref logic [1:0] state_sig, ref logic clk_sig);
+        this.vif = vif;
+        this.state_sig = state_sig;
+        this.clk_sig = clk_sig;
+        this.mbox = new();
+        this.d = new(vif);
+        this.m = new(vif, mbox);
+        this.s = new(mbox);
+        this.icg = new(vif.data_in);
+        this.scg = new(state_sig, clk_sig);
+    endfunction
+
+    task run(int num_packets);
+        packet p;
+        bit is_bad;
+
+        fork
+            m.monitor_output();
+            s.compare();
+        join_none
+
+        // Safe handshake: only send if in correct state
+        if (state_sig == 0) begin
+            p = new(); p.data = "S"; p.flags = 1; p.compute_checksum();
+            s.expected.push_back("A"); icg.sample(); scg.sample(); d.send(p);
+        end
+        if (state_sig == 1) begin
+            p = new(); p.data = "K"; p.flags = 2; p.compute_checksum();
+            s.expected.push_back("C"); icg.sample(); scg.sample(); d.send(p);
+        end
+
+        // Mid-run reset
+        #50; vif.rst <= 1; #10; vif.rst <= 0; #10;
+
+        if (state_sig == 0) begin
+            p = new(); p.data = "S"; p.flags = 1; p.compute_checksum();
+            s.expected.push_back("A"); icg.sample(); scg.sample(); d.send(p);
+        end
+        if (state_sig == 1) begin
+            p = new(); p.data = "K"; p.flags = 2; p.compute_checksum();
+            s.expected.push_back("C"); icg.sample(); scg.sample(); d.send(p);
+        end
+
+        for (int i = 0; i < num_packets; i++) begin
+            p = new(); assert(p.randomize());
+            is_bad = 0;
+            if ($urandom_range(0, 9) < 2) begin
+                p.checksum = p.data ^ 8'hAA;
+                is_bad = 1;
+            end else p.compute_checksum();
+            icg.sample(); scg.sample();
+            if (is_bad)
+                s.expected.push_back("E");
+            else if (p.flags == 1 && state_sig == 0)
+                s.expected.push_back("A");
+            else if (p.flags == 2 && state_sig == 1)
+                s.expected.push_back("C");
+            else
+                s.expected.push_back(p.data);
+            d.send(p);
+        end
+
+        #100;
+        $display("\n=== SIMULATION SUMMARY ===");
+        $display("TOTAL: %0d | PASS: %0d | FAIL: %0d", s.total, s.pass, s.fail);
+        $display("Input Coverage: %0.2f%%", icg.get_inst_coverage());
+        $display("FSM Coverage:   %0.2f%%", scg.get_inst_coverage());
+        if (state_sig != 2 && state_sig != 0) $fatal("FSM did not reach ACK_RECEIVED or reset state");
+        s.report();
+        $finish;
+    endtask
+endclass
+
+module tb_top;
+    logic clk = 0;
+    always #5 clk = ~clk;
+
+    tcpip_if intf(clk);
+    logic [1:0] state_sig;
+
+    tcp_ip_stack_top dut (
+        .clk(intf.clk),
+        .rst(intf.rst),
+        .data_in(intf.data_in),
+        .checksum_in(intf.checksum_in),
+        .valid_in(intf.valid_in),
+        .data_out(intf.data_out),
+        .valid_out(intf.valid_out),
+        .state_out(state_sig)
+    );
+
+    initial begin
+        $dumpfile("dump.vcd");
+        $dumpvars(0, tb_top);
+        $display("[%0t ns] Starting Simulation", $time);
+    end
+
+    initial begin
+        test t;
+        intf.rst = 1;
+        #20 intf.rst = 0;
+        t = new(intf, state_sig, clk);
+        t.run(10);
+    end
+
+    property p_syn_ack;
+        @(posedge clk) disable iff (intf.rst)
+        (intf.valid_in && intf.data_in == "S") |=> (intf.valid_out && intf.data_out == "A");
+    endproperty
+    assert property (p_syn_ack);
+
+    property p_k_response;
+        @(posedge clk) disable iff (intf.rst)
+        (state_sig == 1 && intf.valid_in && intf.data_in == "K") |=> (intf.valid_out && intf.data_out == "C");
+    endproperty
+    assert property (p_k_response);
+
+    property p_bad_checksum;
+        @(posedge clk) disable iff (intf.rst)
+        (intf.valid_in && intf.checksum_in != (intf.data_in ^ 8'hFF)) |=> (intf.valid_out && intf.data_out == "E");
+    endproperty
+    assert property (p_bad_checksum);
+endmodule

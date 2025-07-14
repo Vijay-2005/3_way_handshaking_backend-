@@ -1,0 +1,66 @@
+//=========================
+// DUT: tcp_ip_stack_top.sv
+//=========================
+module tcp_ip_stack_top(
+    input  logic        clk,
+    input  logic        rst,
+    input  logic [7:0]  data_in,
+    input  logic [7:0]  checksum_in,
+    input  logic        valid_in,
+    output logic [7:0]  data_out,
+    output logic        valid_out,
+    output logic [1:0]  state_out
+);
+    typedef enum logic [1:0] {IDLE, SYN_RECEIVED, ACK_RECEIVED} state_t;
+    state_t state;
+
+    assign state_out = state;
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= IDLE;
+            data_out <= 8'h00;
+            valid_out <= 0;
+        end else if (valid_in) begin
+            logic [7:0] calc_checksum;
+            calc_checksum = data_in ^ 8'hFF;
+
+            if (checksum_in != calc_checksum) begin
+                data_out <= "E";
+                valid_out <= 1;
+            end else begin
+                case (state)
+                    IDLE: begin
+                        if (data_in == "S") begin
+                            state <= SYN_RECEIVED;
+                            data_out <= "A";
+                        end else begin
+                            data_out <= data_in;
+                        end
+                        valid_out <= 1;
+                    end
+                    SYN_RECEIVED: begin
+                        if (data_in == "K") begin
+                            state <= ACK_RECEIVED;
+                            data_out <= "C";
+                        end else begin
+                            data_out <= data_in;
+                        end
+                        valid_out <= 1;
+                    end
+                    ACK_RECEIVED: begin
+                        data_out <= data_in;
+                        valid_out <= 1;
+                    end
+                    default: begin
+                        data_out <= 8'h00;
+                        valid_out <= 0;
+                    end
+                endcase
+            end
+        end else begin
+            valid_out <= 0;
+            data_out <= 8'h00;
+        end
+    end
+endmodule
